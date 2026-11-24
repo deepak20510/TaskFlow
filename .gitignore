@@ -5,11 +5,17 @@ node_modules
 /generated/prisma
 
 # Prometheus binaries and runtime data
-# Prometheus binaries and runtime data
 prometheus/prometheus.exe
 prometheus/promtool.exe
 prometheus/data/
+data/
+
+# Redis snapshots
+dump.rdb
+*.rdb
 
 # Other generated files
 node_modules/
 dist/
+redis/
+grafana-data/
