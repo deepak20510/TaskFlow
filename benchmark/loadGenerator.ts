@@ -5,8 +5,8 @@ type Priority = "high" | "medium" | "low";
 
 interface PriorityAllocation {
   priority: Priority;
-  ideal: number; // with decimal
-  count: number; // without decimal
+  ideal: number;
+  count: number;
   remainder: number;
 }
 
@@ -27,13 +27,11 @@ interface LoadGeneratorResult {
 
 function generateProcessingTime(): number {
   const { MIN, MAX } = benchmarkConfig.PROCESSING_TIME_MS;
-
   return Math.floor(Math.random() * (MAX - MIN + 1)) + MIN;
 }
 
 function generatePriorityDistribution(): Priority[] {
   const { TOTAL_JOBS, PRIORITY_DISTRIBUTION } = benchmarkConfig;
-
   const { HIGH, MEDIUM, LOW } = PRIORITY_DISTRIBUTION;
   const totalPercentage = HIGH + MEDIUM + LOW;
 
@@ -43,8 +41,7 @@ function generatePriorityDistribution(): Priority[] {
     );
   }
 
-  // Ideal (decimal) counts
-  const idealHigh = TOTAL_JOBS * (HIGH / 100); // with decimal value like 5.9 we need that 0.9 separate for highest decimal
+  const idealHigh = TOTAL_JOBS * (HIGH / 100);
   const idealMedium = TOTAL_JOBS * (MEDIUM / 100);
   const idealLow = TOTAL_JOBS * (LOW / 100);
 
@@ -70,18 +67,11 @@ function generatePriorityDistribution(): Priority[] {
   ];
 
   let allocatedJobs = 0;
-
   for (const allocation of allocations) {
     allocatedJobs += allocation.count;
   }
 
   const remainingJobs = TOTAL_JOBS - allocatedJobs;
-
-  // Sort by largest remainder.
-  // If remainders are equal,
-  // JavaScript's stable sort preserves
-  // the original priority order
-  // (High → Medium → Low).
   allocations.sort((a, b) => b.remainder - a.remainder);
 
   for (let i = 0; i < remainingJobs; i++) {
@@ -89,7 +79,6 @@ function generatePriorityDistribution(): Priority[] {
   }
 
   const priorities: Priority[] = [];
-
   for (const allocation of allocations) {
     for (let i = 0; i < allocation.count; i++) {
       priorities.push(allocation.priority);
@@ -98,10 +87,7 @@ function generatePriorityDistribution(): Priority[] {
 
   // Fisher-Yates Shuffle
   for (let i = priorities.length - 1; i > 0; i--) {
-    // Math.floor(Math.random() * (MAX - MIN + 1)) + MIN;
-    //Math.floor(Math.random() * (i - 0 + 1)) + 0
     const j = Math.floor(Math.random() * (i + 1));
-
     const temp = priorities[i];
     priorities[i] = priorities[j];
     priorities[j] = temp;
@@ -123,7 +109,6 @@ interface BenchmarkPayload {
 
 export async function generateLoad(): Promise<LoadGeneratorResult> {
   const loadStartTime = performance.now();
-
   const benchmarkUserId = `benchmark-${Date.now()}`;
 
   let totalBatches = 0;
@@ -134,11 +119,15 @@ export async function generateLoad(): Promise<LoadGeneratorResult> {
   let submissionFailedJobs = 0;
   let processingStartTime = 0;
 
-  const { TOTAL_JOBS, BATCH_SIZE, BATCH_DELAY_MS, API_URL } = benchmarkConfig;
-
+  const { TOTAL_JOBS, BATCH_SIZE, BATCH_DELAY_MS, API_URL, API_KEY } = benchmarkConfig;
   const priorities = generatePriorityDistribution();
-
   const batch: BenchmarkJob[] = [];
+
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": API_KEY,
+    "x-user-id": benchmarkUserId,
+  };
 
   for (const priority of priorities) {
     const job: BenchmarkJob = {
@@ -154,14 +143,17 @@ export async function generateLoad(): Promise<LoadGeneratorResult> {
 
     if (batch.length === BATCH_SIZE) {
       totalBatches++;
-
       const currentBatchSize = batch.length;
 
       try {
-        await axios.post(API_URL, {
-          userId: benchmarkUserId,
-          jobs: batch,
-        });
+        await axios.post(
+          API_URL,
+          {
+            userId: benchmarkUserId,
+            jobs: batch,
+          },
+          { headers },
+        );
 
         successfulBatches++;
         submittedJobs += currentBatchSize;
@@ -169,28 +161,33 @@ export async function generateLoad(): Promise<LoadGeneratorResult> {
         if (processingStartTime === 0) {
           processingStartTime = performance.now();
         }
-      } catch (error) {
-        console.error("Failed to submit batch:", error);
+      } catch (error: any) {
+        console.error("Failed to submit batch:", error.response?.data || error.message);
         failedBatches++;
         submissionFailedJobs += currentBatchSize;
       }
 
       batch.length = 0;
 
-      await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
+      if (BATCH_DELAY_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
+      }
     }
   }
 
   if (batch.length > 0) {
     totalBatches++;
-
     const currentBatchSize = batch.length;
 
     try {
-      await axios.post(API_URL, {
-        userId: benchmarkUserId,
-        jobs: batch,
-      });
+      await axios.post(
+        API_URL,
+        {
+          userId: benchmarkUserId,
+          jobs: batch,
+        },
+        { headers },
+      );
 
       successfulBatches++;
       submittedJobs += currentBatchSize;
@@ -198,10 +195,10 @@ export async function generateLoad(): Promise<LoadGeneratorResult> {
       if (processingStartTime === 0) {
         processingStartTime = performance.now();
       }
-    } catch (error) {
+    } catch (error: any) {
       failedBatches++;
       submissionFailedJobs += currentBatchSize;
-      console.error("Failed to submit final batch:", error);
+      console.error("Failed to submit final batch:", error.response?.data || error.message);
     }
   }
 
@@ -213,11 +210,9 @@ export async function generateLoad(): Promise<LoadGeneratorResult> {
     totalBatches,
     successfulBatches,
     failedBatches,
-
     loadStartTime,
     loadEndTime,
     processingStartTime,
-
     submittedJobs,
     submissionFailedJobs,
   };

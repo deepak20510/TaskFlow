@@ -7,18 +7,24 @@ import prisma from "../api-service/dbclient";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function calculatePercentile(values: number[], percentile: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.ceil((percentile / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, Math.min(index, sorted.length - 1))];
+}
+
 export async function runBenchMark() {
   try {
-    console.log("2. Before performance.now()");
     const startTime = performance.now();
 
-    console.log("3. Before generateLoad()");
+    console.log(`🚀 Starting TaskFlow Benchmark: Target ${benchmarkConfig.TOTAL_JOBS} jobs across priorities...`);
 
     const loadResult = await generateLoad();
     const benchmarkUserId = loadResult.benchmarkUserId;
 
     console.log(
-      `generateLoad took ${(loadResult.loadEndTime - loadResult.loadStartTime).toFixed(2)} ms`,
+      `Load generation completed in ${(loadResult.loadEndTime - loadResult.loadStartTime).toFixed(2)} ms`,
     );
 
     console.log(`\nTotal jobs configured: ${loadResult.totalJobs}`);
@@ -30,7 +36,7 @@ export async function runBenchMark() {
     if (loadResult.submittedJobs > 0) {
       console.log("\nWaiting for all benchmark jobs to finish...\n");
 
-      const MAX_WAIT_MS = benchmarkConfig.BENCHMARK_TIMEOUT_MS; // Benchmark timeout
+      const MAX_WAIT_MS = benchmarkConfig.BENCHMARK_TIMEOUT_MS;
       const waitStart = Date.now();
       const waitStartPerf = performance.now();
 
@@ -44,8 +50,6 @@ export async function runBenchMark() {
           },
         });
 
-        console.log(`User=${benchmarkUserId}, Processed=${processedJobs}`);
-
         process.stdout.write(
           `\rProcessed: ${processedJobs}/${loadResult.submittedJobs}`,
         );
@@ -56,7 +60,7 @@ export async function runBenchMark() {
 
         if (Date.now() - waitStart > MAX_WAIT_MS) {
           throw new Error(
-            "Benchmark timed out while waiting for all submitted jobs to finish.",
+            `Benchmark timed out after ${MAX_WAIT_MS / 1000}s while waiting for jobs to finish.`,
           );
         }
 
@@ -64,59 +68,76 @@ export async function runBenchMark() {
       }
 
       processingEndTime = performance.now();
-
       console.log(
-        `\nWaiting loop took ${(performance.now() - waitStartPerf).toFixed(2)} ms`,
+        `\n\nQueue drain completed in ${(processingEndTime - waitStartPerf).toFixed(2)} ms`,
       );
     } else {
-      console.log(
-        "\nNo jobs were successfully submitted. Skipping processing wait.",
-      );
+      console.log("\nNo jobs were successfully submitted. Skipping processing wait.");
     }
 
-    const completedJobs = await prisma.job.count({
+    // Query terminal jobs to calculate exact latencies
+    const finishedJobs = await prisma.job.findMany({
       where: {
         userId: benchmarkUserId,
-        status: "COMPLETED",
+        status: { in: ["COMPLETED", "DLQ"] },
+      },
+      select: {
+        status: true,
+        createdAt: true,
+        startedAt: true,
+        completedAt: true,
+        attempts: true,
       },
     });
 
-    const failedJobs = await prisma.job.count({
-      where: {
-        userId: benchmarkUserId,
-        status: "DLQ",
-      },
-    });
+    const completedJobs = finishedJobs.filter((j) => j.status === "COMPLETED").length;
+    const failedJobs = finishedJobs.filter((j) => j.status === "DLQ").length;
+    const retriedJobs = finishedJobs.filter((j) => j.attempts > 0).length;
 
-    const terminalJobs = completedJobs + failedJobs;
+    // Calculate queue wait times and processing durations
+    const waitTimes: number[] = [];
+    const executionDurations: number[] = [];
 
-    if (terminalJobs !== loadResult.submittedJobs) {
-      throw new Error(
-        `Job count mismatch. Submitted: ${loadResult.submittedJobs}, Terminal: ${terminalJobs}`,
-      );
+    for (const job of finishedJobs) {
+      if (job.startedAt && job.createdAt) {
+        const wait = job.startedAt.getTime() - job.createdAt.getTime();
+        if (wait >= 0) waitTimes.push(wait);
+      }
+      if (job.completedAt && job.startedAt) {
+        const duration = job.completedAt.getTime() - job.startedAt.getTime();
+        if (duration >= 0) executionDurations.push(duration);
+      }
     }
 
-    console.log(
-      "\nAll submitted benchmark jobs have reached a terminal state.",
-    );
+    const p50LatencyMs = calculatePercentile(executionDurations, 50);
+    const p95LatencyMs = calculatePercentile(executionDurations, 95);
+    const p99LatencyMs = calculatePercentile(executionDurations, 99);
+    const avgDurationMs =
+      executionDurations.length > 0
+        ? executionDurations.reduce((a, b) => a + b, 0) / executionDurations.length
+        : 0;
+    const avgWaitTimeMs =
+      waitTimes.length > 0 ? waitTimes.reduce((a, b) => a + b, 0) / waitTimes.length : 0;
 
     const endTime = performance.now();
 
     const benchmarkResult: BenchmarkResult = {
       startTime,
       endTime,
-
       ...loadResult,
-
       processingEndTime,
-
       completedJobs,
       failedJobs,
+      retriedJobs,
+      p50LatencyMs,
+      p95LatencyMs,
+      p99LatencyMs,
+      avgDurationMs,
+      avgWaitTimeMs,
     };
 
-    console.log(`TOTAL benchmark time: ${(endTime - startTime).toFixed(2)} ms`);
-
     generateBenchmarkReport(benchmarkResult);
+    return benchmarkResult;
   } catch (error) {
     console.error("Failed to run benchmark:", error);
     throw error;

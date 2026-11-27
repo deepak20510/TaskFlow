@@ -1,63 +1,75 @@
 import { Request, Response, NextFunction } from "express";
-import { redisClient } from "../../shared/redis/redisClient";
+import { getAllStreams } from "../../shared/utils/partition";
+import { RedisStreamQueue } from "../../shared/redis/streamQueue";
 
-const ALL_QUEUES = [
-  // HIGH PRIORITY
-  "high_priority_queue:0",
-  "high_priority_queue:1",
-  "high_priority_queue:2",
-  "high_priority_queue:3",
+const HARD_LIMIT = parseInt(process.env.BACKPRESSURE_HARD_LIMIT || "8000", 10);
+const SOFT_LIMIT = parseInt(process.env.BACKPRESSURE_SOFT_LIMIT || "5000", 10);
+const CACHE_TTL_MS = 1000; // Cache aggregated depth for 1 second to avoid 12 Redis queries per HTTP request
 
-  // MEDIUM PRIORITY
-  "medium_priority_queue:0",
-  "medium_priority_queue:1",
-  "medium_priority_queue:2",
-  "medium_priority_queue:3",
+let cachedTotalDepth = 0;
+let lastDepthCheckTime = 0;
+let isCheckingDepth = false;
 
-  // LOW PRIORITY
-  "low_priority_queue:0",
-  "low_priority_queue:1",
-  "low_priority_queue:2",
-  "low_priority_queue:3",
-];
+async function getCachedTotalQueueDepth(): Promise<number> {
+  const now = Date.now();
+  if (now - lastDepthCheckTime < CACHE_TTL_MS) {
+    return cachedTotalDepth;
+  }
+
+  // Prevent multiple overlapping concurrent depth scans
+  if (isCheckingDepth) {
+    return cachedTotalDepth;
+  }
+
+  isCheckingDepth = true;
+  try {
+    const allStreams = getAllStreams();
+    const depths = await Promise.all(
+      allStreams.map((stream) => RedisStreamQueue.getQueueDepth(stream)),
+    );
+
+    cachedTotalDepth = depths.reduce((sum, d) => sum + d, 0);
+    lastDepthCheckTime = now;
+  } catch (err: any) {
+    console.error("[BackPressure] Error checking queue depths:", err.message);
+  } finally {
+    isCheckingDepth = false;
+  }
+
+  return cachedTotalDepth;
+}
 
 export async function backPressureMiddleware(
   req: Request,
   res: Response,
   next: NextFunction,
 ) {
-  let queueSize = 0;
-
   try {
-    const sizes = await Promise.all(
-      ALL_QUEUES.map((queue) => redisClient.lLen(queue)),
-    );
+    const queueSize = await getCachedTotalQueueDepth();
 
-    queueSize = sizes.reduce((sum, size) => sum + size, 0);
-  } catch (e) {
-    console.error("Backpressure check failed", e);
+    // Hard reject
+    if (queueSize > HARD_LIMIT) {
+      console.warn("🚨 [Backpressure] Rejecting request due to system queue overload:", { queueSize, HARD_LIMIT });
 
-    return next(); // fail open
+      res.setHeader("Retry-After", "30");
+      return res.status(429).json({
+        success: false,
+        error: {
+          code: "SYSTEM_OVERLOADED",
+          message: "System queue is currently overloaded. Please try again later.",
+          retryAfter: 30,
+        },
+      });
+    }
+
+    // Soft slowdown
+    if (queueSize > SOFT_LIMIT) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    next();
+  } catch (e: any) {
+    console.error("[BackPressure] Middleware error:", e.message);
+    next(); // Fail open so middleware error doesn't block requests
   }
-
-  // Hard reject
-  if (queueSize > 8000) {
-    console.warn("🚨 Backpressure: rejecting request", {
-      queueSize,
-    });
-
-    res.setHeader("Retry-After", "30");
-
-    return res.status(429).json({
-      message: "System overloaded. Please try again later.",
-      retryAfter: 30,
-    });
-  }
-
-  // Soft slowdown
-  if (queueSize > 5000) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-
-  next();
 }

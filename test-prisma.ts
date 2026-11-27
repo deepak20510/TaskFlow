@@ -2,8 +2,6 @@ import "dotenv/config";
 import { Pool } from "pg";
 import prisma from "./api-service/dbclient";
 
-console.log("DATABASE_URL:", process.env.DATABASE_URL);
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });

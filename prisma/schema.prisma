@@ -33,6 +33,22 @@ model Job {
   @@index([createdAt])
 }
 
+model OutboxEvent {
+  id          String       @id @default(uuid())
+  jobId       String
+  streamName  String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  publishedAt DateTime?
+
+  @@index([status, createdAt])
+  @@index([jobId])
+}
+
 enum JobStatus {
   QUEUED
   PROCESSING
@@ -44,4 +60,10 @@ enum JobPriority {
   LOW
   MEDIUM
   HIGH
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
 }

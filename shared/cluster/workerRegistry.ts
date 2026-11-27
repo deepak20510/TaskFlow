@@ -1,50 +1,89 @@
 import { redisClient } from "../redis/redisClient";
 
 const WORKER_TTL = 15;
-function getWorkerKey(workerId: string) {
+const WORKER_SET_KEY = "workers:active_set";
+
+function getWorkerKey(workerId: string): string {
   return `active_worker:${workerId}`;
 }
 
-// Register Worker
-export async function registerWorker(workerId: string) {
+/**
+ * Register worker with heartbeat TTL and membership in active set
+ */
+export async function registerWorker(workerId: string): Promise<void> {
   const key = getWorkerKey(workerId);
 
   await redisClient.set(key, "alive", {
     EX: WORKER_TTL,
   });
-  console.log(`🟢Registered worker ${workerId}`);
+
+  await redisClient.sAdd(WORKER_SET_KEY, workerId);
+  console.log(`🟢 Registered worker ${workerId}`);
 }
 
-//Renew worker HEARTBEAT
-
-export async function renewWorkerHeartbeat(workerId: string) {
+/**
+ * Renew worker heartbeat TTL
+ */
+export async function renewWorkerHeartbeat(workerId: string): Promise<boolean> {
   const key = getWorkerKey(workerId);
   const exists = await redisClient.exists(key);
 
   if (!exists) {
-    console.log(`❌ Worker missing from registry ${workerId}`);
-    return false;
+    // Re-register if expired
+    await registerWorker(workerId);
+    return true;
   }
 
   await redisClient.expire(key, WORKER_TTL);
-  console.log(`💓 Renewed worker heartbeat ${workerId}`);
   return true;
 }
 
-/// Get Active Workers
+/**
+ * Get all active workers, pruning dead workers from the set
+ */
+export async function getActiveWorkers(): Promise<string[]> {
+  try {
+    const workers = await redisClient.sMembers(WORKER_SET_KEY);
+    if (!workers || workers.length === 0) {
+      return [];
+    }
 
-export async function getActiveWorkers() {
-  const keys = await redisClient.keys("active_worker:*");
+    const activeWorkers: string[] = [];
+    const deadWorkers: string[] = [];
 
-  return keys.map((key) => {
-    return key.replace("active_worker:", "");
-  });
+    await Promise.all(
+      workers.map(async (workerId) => {
+        const isAlive = await redisClient.exists(getWorkerKey(workerId));
+        if (isAlive) {
+          activeWorkers.push(workerId);
+        } else {
+          deadWorkers.push(workerId);
+        }
+      }),
+    );
+
+    // Clean up dead workers asynchronously
+    if (deadWorkers.length > 0) {
+      await redisClient.sRem(WORKER_SET_KEY, deadWorkers);
+    }
+
+    return activeWorkers;
+  } catch (err) {
+    console.error("[WorkerRegistry] Error getting active workers:", err);
+    return [];
+  }
 }
 
-export async function removeWorker(workerId: string) {
+/**
+ * Remove worker gracefully on shutdown
+ */
+export async function removeWorker(workerId: string): Promise<void> {
   const key = getWorkerKey(workerId);
 
-  await redisClient.del(key);
+  await Promise.all([
+    redisClient.del(key),
+    redisClient.sRem(WORKER_SET_KEY, workerId),
+  ]);
 
   console.log(`🔴 Removed worker ${workerId}`);
 }

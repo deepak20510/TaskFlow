@@ -1,12 +1,17 @@
 import { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import prisma from "../dbclient";
-import { addJobToQueue } from "../queue/jobQueue";
 import { JobPriority } from "../../generated/prisma/index";
-import { getPartitionedQueue } from "../../shared/utils/partition";
-type Priority = "high" | "medium" | "low";
+import { getPartitionedStream } from "../../shared/utils/partition";
+import { OutboxPublisher } from "../../shared/outbox/outboxPublisher";
+import { JobStateService } from "../../shared/lifecycle/jobStateService";
+import {
+  createJobSchema,
+  createBatchJobsSchema,
+  JobPriorityInput,
+} from "../validators/job.validator";
 
-const PRIORITY_DB_MAP: Record<Priority, JobPriority> = {
+const PRIORITY_DB_MAP: Record<JobPriorityInput, JobPriority> = {
   high: JobPriority.HIGH,
   medium: JobPriority.MEDIUM,
   low: JobPriority.LOW,
@@ -14,184 +19,318 @@ const PRIORITY_DB_MAP: Record<Priority, JobPriority> = {
 
 export async function createJob(req: Request, res: Response) {
   try {
-    const jobId = uuidv4();
-
-    if (!req.body.type) {
-      return res.status(400).json({ message: "Job type is required" });
-    }
-    if (typeof req.body.userId !== "string" || req.body.userId.trim() === "") {
+    const parseResult = createJobSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      const issues = parseResult.error.issues || [];
+      const message = issues.length > 0 ? issues.map((e) => e.message).join(", ") : parseResult.error.message;
       return res.status(400).json({
-        message: "Valid userId is required",
+        success: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          message,
+          details: issues,
+        },
       });
     }
-    // Normalize priority
-    let priority = (req.body.priority || "medium").toLowerCase();
 
-    if (!["high", "medium", "low"].includes(priority)) {
-      priority = "medium";
-    }
+    const validData = parseResult.data;
+    // Derive verified user identity from authenticated request context
+    const verifiedUserId = req.user?.userId || req.body.userId || "anonymous";
+    const jobId = uuidv4();
+    const outboxId = uuidv4();
+    const streamName = getPartitionedStream(validData.priority, verifiedUserId);
 
-    const safePriority = priority as Priority;
-
-    const jobData = {
+    const jobPayload = {
       id: jobId,
-      userId: req.body.userId,
-      type: req.body.type,
-      priority: safePriority,
-      payload: req.body.payload || {},
+      userId: verifiedUserId,
+      type: validData.type,
+      priority: validData.priority,
+      payload: validData.payload,
+      maxRetries: validData.maxRetries,
+      attempts: 0,
+      createdAt: new Date().toISOString(),
     };
 
     /**
-     * STEP 1: INSERT INTO DB (SOURCE OF TRUTH)
+     * TRANSACTIONAL OUTBOX:
+     * Save Job entity and OutboxEvent atomically within PostgreSQL transaction
      */
-    await prisma.job.create({
+    await prisma.$transaction(async (tx) => {
+      await tx.job.create({
+        data: {
+          id: jobId,
+          type: validData.type,
+          userId: verifiedUserId,
+          payload: validData.payload as any,
+          priority: PRIORITY_DB_MAP[validData.priority],
+          status: "QUEUED",
+          attempts: 0,
+          maxRetries: validData.maxRetries,
+        },
+      });
+
+      await tx.outboxEvent.create({
+        data: {
+          id: outboxId,
+          jobId,
+          streamName,
+          payload: jobPayload as any,
+          status: "PENDING",
+        },
+      });
+    });
+
+    // Attempt immediate publication; non-blocking fallback to background outbox scanner
+    void OutboxPublisher.publishEventImmediately(outboxId);
+
+    return res.status(201).json({
+      success: true,
       data: {
-        id: jobId,
-        type: jobData.type,
-        userId: req.body.userId,
-        payload: jobData.payload,
-        priority: PRIORITY_DB_MAP[safePriority],
+        jobId,
         status: "QUEUED",
-        attempts: 0,
-        maxRetries: req.body.maxRetries || 3,
-        createdAt: new Date(),
+        userId: verifiedUserId,
+        priority: validData.priority,
       },
     });
-
-    /**
-     * STEP 2: PUSH TO REDIS (EXECUTION LAYER)
-     */
-    const queueName = getPartitionedQueue(safePriority, req.body.userId);
-
-    await addJobToQueue(queueName, jobData);
-
-    /**
-     * RESPONSE
-     */
-    return res.status(201).json({
-      jobId,
-      status: "QUEUED",
-      userId: req.body.userId,
-      priority: safePriority,
-    });
   } catch (error: any) {
-    console.error(error);
-
-    res.status(500).json({
-      message: error.message,
+    console.error("[JobController] createJob error:", error);
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to create job",
+      },
     });
   }
 }
 
-interface ValidJob {
-  id: string;
-  userId: string;
-  type: string;
-  payload: any;
-  priority: Priority;
-  maxRetries: number;
-  createdAt: Date;
-}
 export async function createBatchJobs(req: Request, res: Response) {
-  console.log("ENTERED createBatchJobs");
   try {
-    const { userId, jobs } = req.body;
-
-    if (typeof userId !== "string" || userId.trim() === "") {
+    const parseResult = createBatchJobsSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      const issues = parseResult.error.issues || [];
+      const message = issues.length > 0 ? issues.map((e) => e.message).join(", ") : parseResult.error.message;
       return res.status(400).json({
-        message: "Valid userId is required",
+        success: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          message,
+          details: issues,
+        },
       });
     }
 
-    if (!Array.isArray(jobs) || jobs.length === 0) {
-      return res.status(400).json({
-        message: "Jobs array is required",
-      });
-    }
+    const { jobs } = parseResult.data;
+    const verifiedUserId = req.user?.userId || req.body.userId || "anonymous";
 
-    const validJobs: ValidJob[] = [];
-    for (const job of jobs) {
-      if (!job.type) continue;
+    const preparedJobs = jobs.map((job) => {
+      const jobId = uuidv4();
+      const outboxId = uuidv4();
+      const streamName = getPartitionedStream(job.priority, verifiedUserId);
 
-      let priority = (job.priority || "medium").toLowerCase();
-
-      if (!["high", "medium", "low"].includes(priority)) {
-        priority = "medium";
-      }
-
-      const safePriority = priority as Priority;
-
-      validJobs.push({
-        id: uuidv4(),
-        userId,
-        type: job.type,
-        payload: job.payload || {},
-        priority: safePriority,
-        maxRetries: job.maxRetries || 3,
-        createdAt: new Date(),
-      });
-    }
-
-    if (validJobs.length === 0) {
-      return res.status(400).json({
-        message: "No valid jobs found",
-      });
-    }
-
-    /**
-     * STEP 1
-     * Bulk insert into PostgreSQL
-     */
-
-    await prisma.job.createMany({
-      data: validJobs.map((job) => ({
-        id: job.id,
-        type: job.type,
-        userId: job.userId,
-        payload: job.payload,
-        priority: PRIORITY_DB_MAP[job.priority],
-        status: "QUEUED",
-        attempts: 0,
-        maxRetries: job.maxRetries,
-        createdAt: job.createdAt,
-      })),
-    });
-
-    /**
-     * STEP 2
-     * Push every job to Redis in parallel
-     */
-    await Promise.all(
-      validJobs.map((job) => {
-        const queueName = getPartitionedQueue(job.priority, job.userId);
-
-        return addJobToQueue(queueName, {
-          id: job.id,
-          userId: job.userId,
+      return {
+        jobId,
+        outboxId,
+        streamName,
+        data: {
+          id: jobId,
+          userId: verifiedUserId,
           type: job.type,
           priority: job.priority,
           payload: job.payload,
-        });
-      }),
-    );
+          maxRetries: job.maxRetries,
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+        },
+      };
+    });
+
+    /**
+     * Atomic batch transaction inserting all jobs and outbox events
+     */
+    await prisma.$transaction(async (tx) => {
+      await tx.job.createMany({
+        data: preparedJobs.map(({ data }) => ({
+          id: data.id,
+          type: data.type,
+          userId: verifiedUserId,
+          payload: data.payload as any,
+          priority: PRIORITY_DB_MAP[data.priority as JobPriorityInput],
+          status: "QUEUED",
+          attempts: 0,
+          maxRetries: data.maxRetries,
+        })),
+      });
+
+      await tx.outboxEvent.createMany({
+        data: preparedJobs.map(({ outboxId, jobId, streamName, data }) => ({
+          id: outboxId,
+          jobId,
+          streamName,
+          payload: data as any,
+          status: "PENDING",
+        })),
+      });
+    });
+
+    // Trigger immediate async publication for the batch
+    for (const { outboxId } of preparedJobs) {
+      void OutboxPublisher.publishEventImmediately(outboxId);
+    }
 
     return res.status(201).json({
-      message: "Batch processing completed",
-      totalReceived: jobs.length,
-      totalAccepted: validJobs.length,
-      totalFailed: jobs.length - validJobs.length,
-      jobs: validJobs.map((job) => ({
-        jobId: job.id,
-        priority: job.priority,
+      success: true,
+      message: "Batch submission completed successfully",
+      totalSubmitted: preparedJobs.length,
+      jobs: preparedJobs.map((j) => ({
+        jobId: j.jobId,
+        priority: j.data.priority,
       })),
     });
   } catch (error: any) {
-    console.error("========== FULL ERROR ==========");
-    console.error(error);
-
+    console.error("[JobController] createBatchJobs error:", error);
     return res.status(500).json({
-      message: error.message,
-      stack: error.stack,
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to process batch submission",
+      },
+    });
+  }
+}
+
+export async function getJobById(req: Request, res: Response) {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const verifiedUserId = req.user?.userId;
+
+    const job = await prisma.job.findUnique({
+      where: { id },
+    });
+
+    // Tenant isolation: allow only the job owner or admin to view the job
+    if (!job || (verifiedUserId && job.userId !== verifiedUserId && req.user?.role !== "admin")) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: "NOT_FOUND",
+          message: "Job not found",
+        },
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: job,
+    });
+  } catch (error: any) {
+    console.error("[JobController] getJobById error:", error);
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to fetch job",
+      },
+    });
+  }
+}
+
+export async function listJobs(req: Request, res: Response) {
+  try {
+    const verifiedUserId = req.user?.userId;
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+    const status = req.query.status as any;
+
+    const where: any = {};
+    if (verifiedUserId && req.user?.role !== "admin") {
+      where.userId = verifiedUserId;
+    }
+    if (status) {
+      where.status = status;
+    }
+
+    const [total, jobs] = await Promise.all([
+      prisma.job.count({ where }),
+      prisma.job.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+      }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        total,
+        page,
+        limit,
+        jobs,
+      },
+    });
+  } catch (error: any) {
+    console.error("[JobController] listJobs error:", error);
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to list jobs",
+      },
+    });
+  }
+}
+
+export async function replayDLQJob(req: Request, res: Response) {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const replayedJob = await JobStateService.replayDLQJob(id);
+
+    if (!replayedJob) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: "CANNOT_REPLAY",
+          message: "Job is not in DLQ state or does not exist",
+        },
+      });
+    }
+
+    // Insert an Outbox event to dispatch the replayed job
+    const streamName = getPartitionedStream(replayedJob.priority.toLowerCase(), replayedJob.userId);
+    const outboxEvent = await prisma.outboxEvent.create({
+      data: {
+        jobId: replayedJob.id,
+        streamName,
+        payload: {
+          id: replayedJob.id,
+          userId: replayedJob.userId,
+          type: replayedJob.type,
+          priority: replayedJob.priority.toLowerCase(),
+          payload: replayedJob.payload,
+          maxRetries: replayedJob.maxRetries,
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+        },
+        status: "PENDING",
+      },
+    });
+
+    void OutboxPublisher.publishEventImmediately(outboxEvent.id);
+
+    return res.status(200).json({
+      success: true,
+      message: "Job successfully replayed and queued for execution",
+      data: replayedJob,
+    });
+  } catch (error: any) {
+    console.error("[JobController] replayDLQJob error:", error);
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to replay DLQ job",
+      },
     });
   }
 }

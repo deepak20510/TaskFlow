@@ -7,8 +7,7 @@ export interface BenchmarkResult {
   loadStartTime: number;
   loadEndTime: number;
 
-  // Processing window: first successful submission
-  // until all submitted jobs reach terminal states
+  // Processing window
   processingStartTime: number;
   processingEndTime: number;
 
@@ -24,6 +23,14 @@ export interface BenchmarkResult {
   // Processing statistics
   completedJobs: number;
   failedJobs: number;
+  retriedJobs?: number;
+
+  // Latencies & Percentiles (ms)
+  p50LatencyMs?: number;
+  p95LatencyMs?: number;
+  p99LatencyMs?: number;
+  avgDurationMs?: number;
+  avgWaitTimeMs?: number;
 }
 
 export interface BenchmarkSummary {
@@ -33,7 +40,13 @@ export interface BenchmarkSummary {
 
   successRate: number;
   failureRate: number;
+  retryRate?: number;
+  dlqRate?: number;
 
   endToEndThroughput: number;
   processingThroughput: number;
+
+  p50LatencyMs?: number;
+  p95LatencyMs?: number;
+  p99LatencyMs?: number;
 }

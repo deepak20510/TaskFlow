@@ -2,14 +2,12 @@ import crypto from "crypto";
 import "dotenv/config";
 import { connectRedis, redisClient } from "../../shared/redis/redisClient";
 import { processJob } from "../processors/jobProcessor";
-import prisma from "../../api-service/dbclient";
 import { metrics } from "../../shared/metrics/metrics";
 import {
   jobDuration,
   dbDuration,
   businessLogicDuration,
 } from "../../shared/metrics/prometheus";
-import { getPartitionedQueue } from "../../shared/utils/partition";
 import {
   claimPartition,
   releasePartition,
@@ -21,70 +19,85 @@ import {
   removeWorker,
   renewWorkerHeartbeat,
 } from "../../shared/cluster/workerRegistry";
-
 import { Scheduler } from "../scheduler/schedular";
 import { startMetricsServer } from "../../shared/metrics/metricsServer";
+import { RedisStreamQueue } from "../../shared/redis/streamQueue";
+import { DistributedLockManager, LockHandle } from "../../shared/redis/lockManager";
+import { JobStateService } from "../../shared/lifecycle/jobStateService";
+import { calculateBackoffDelay } from "../../shared/utils/backoff";
+import { DelayedQueueManager } from "../../shared/delayed/delayedQueue";
+import { isNonRetryableError } from "../../shared/errors/jobErrors";
+import { getAllStreams } from "../../shared/utils/partition";
 
 console.log("🚀 WORKER FILE STARTED");
-console.log("DATABASE_URL:", process.env.DATABASE_URL);
 const workerId = `worker-${crypto.randomUUID()}`;
 
-let heartbeatInterval: NodeJS.Timeout;
+let heartbeatInterval: NodeJS.Timeout | null = null;
+let delayedQueueInterval: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
-/**
- * Weighted Scheduling (5:2:1)
- *
- * Why?
- * - High priority should get more CPU time
- * - BUT low priority should not starve
- *
- * Without this → low priority jobs may never run ❌
- */
+let activeJobsCount = 0;
 
 const ALL_PARTITIONS = [
   // High
-  "high_priority_queue:0",
-  "high_priority_queue:1",
-  "high_priority_queue:2",
-  "high_priority_queue:3",
+  "high_priority_stream:0",
+  "high_priority_stream:1",
+  "high_priority_stream:2",
+  "high_priority_stream:3",
 
   // Medium
-  "medium_priority_queue:0",
-  "medium_priority_queue:1",
-  "medium_priority_queue:2",
-  "medium_priority_queue:3",
+  "medium_priority_stream:0",
+  "medium_priority_stream:1",
+  "medium_priority_stream:2",
+  "medium_priority_stream:3",
 
   // Low
-  "low_priority_queue:0",
-  "low_priority_queue:1",
-  "low_priority_queue:2",
-  "low_priority_queue:3",
+  "low_priority_stream:0",
+  "low_priority_stream:1",
+  "low_priority_stream:2",
+  "low_priority_stream:3",
 ];
 
-/**
- * Utility: prevents retry storms
- * If jobs fail instantly and retry immediately → system overload 💥
- * So we add delay between retries
- */
-async function sleep(ms: number) {
+async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function shutdown() {
+/**
+ * Graceful shutdown sequence
+ */
+async function shutdown(): Promise<void> {
+  if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`🛑 Shutting down ${workerId}`);
+  console.log(`🛑 [Worker] Initiating graceful shutdown for ${workerId}...`);
 
-  for (const queue of ALL_PARTITIONS) {
-    await releasePartition(queue, workerId);
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  if (delayedQueueInterval) clearInterval(delayedQueueInterval);
+
+  // Wait for in-flight jobs to finish with a grace period
+  const GRACE_PERIOD_MS = 15000;
+  const shutdownStart = Date.now();
+
+  while (activeJobsCount > 0 && Date.now() - shutdownStart < GRACE_PERIOD_MS) {
+    console.log(`⏳ [Worker] Waiting for ${activeJobsCount} in-flight job(s) to complete...`);
+    await sleep(500);
   }
 
-  await removeWorker(workerId);
+  // Release all partition ownerships
+  for (const queue of ALL_PARTITIONS) {
+    try {
+      await releasePartition(queue, workerId);
+    } catch {}
+  }
 
-  clearInterval(heartbeatInterval);
+  // Remove worker registration
+  try {
+    await removeWorker(workerId);
+  } catch {}
 
+  console.log(`✅ [Worker] Clean shutdown complete for ${workerId}.`);
   process.exit(0);
 }
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
@@ -96,26 +109,16 @@ async function startHeartbeat(
   while (!isShuttingDown) {
     try {
       for (const queue of [...ownedPartitions]) {
-        console.log(`💓 Attempting renewal for ${queue}`);
-
         const renewed = await renewPartitionLease(queue, workerId);
-
-        if (renewed) {
-          console.log(`✅ Renewed ${queue}`);
-        } else {
-          console.log(`${workerId} Lost ownership of ${queue}`);
-
+        if (!renewed) {
+          console.warn(`[Worker] Lost ownership of ${queue}`);
           ownedPartitions.delete(queue);
-
           scheduler.updateQueues(Array.from(ownedPartitions));
-
-          console.log(`❌ Failed renewal ${queue}`);
         }
       }
     } catch (err) {
-      console.error("Heartbeat loop error", err);
+      console.error("[Worker] Heartbeat loop error:", err);
     }
-
     await sleep(5000);
   }
 }
@@ -135,35 +138,54 @@ async function startClaimLoop(
       const fairShare = Math.ceil(ALL_PARTITIONS.length / workers.length);
 
       for (const queue of ALL_PARTITIONS) {
-        // Already own it
-        if (ownedPartitions.has(queue)) {
-          continue;
-        }
-
-        // Reached fair limit
-        if (ownedPartitions.size >= fairShare) {
-          break;
-        }
+        if (ownedPartitions.has(queue)) continue;
+        if (ownedPartitions.size >= fairShare) break;
 
         const claimed = await claimPartition(queue, workerId);
         if (claimed) {
           ownedPartitions.add(queue);
-
           scheduler.updateQueues(Array.from(ownedPartitions));
-
-          console.log(`${workerId} claimed ${queue}`);
+          console.log(`🟢 ${workerId} claimed ${queue}`);
         }
       }
     } catch (err) {
-      console.error("Claim loop error", err);
+      console.error("[Worker] Claim loop error:", err);
     }
-
     await sleep(5000);
   }
 }
 
-async function startWorker() {
-  console.log("Starting worker...");
+async function startRebalance(
+  workerId: string,
+  ownedPartitions: Set<string>,
+  scheduler: Scheduler,
+) {
+  while (!isShuttingDown) {
+    try {
+      const workers = await getActiveWorkers();
+      if (workers.length === 0) {
+        await sleep(5000);
+        continue;
+      }
+      const fairShare = Math.ceil(ALL_PARTITIONS.length / workers.length);
+      const maxAllowed = fairShare + 1;
+
+      if (ownedPartitions.size > maxAllowed) {
+        const partitionToRelease = [...ownedPartitions][0];
+        console.log(`⚖️ ${workerId} releasing ${partitionToRelease} for rebalance`);
+        await releasePartition(partitionToRelease, workerId);
+        ownedPartitions.delete(partitionToRelease);
+        scheduler.updateQueues(Array.from(ownedPartitions));
+      }
+    } catch (error) {
+      console.error("[Worker] Rebalance loop error:", error);
+    }
+    await sleep(10000);
+  }
+}
+
+export async function startWorker(): Promise<void> {
+  console.log("Starting worker engine...");
 
   await connectRedis();
   console.log("Worker connected to Redis");
@@ -171,254 +193,119 @@ async function startWorker() {
   await registerWorker(workerId);
   heartbeatInterval = setInterval(async () => {
     if (isShuttingDown) return;
-
     try {
       await renewWorkerHeartbeat(workerId);
     } catch (err) {
-      console.error("Worker heartbeat failed", err);
+      console.error("[Worker] Worker heartbeat failed:", err);
     }
   }, 5000);
 
-  const ownedPartitions = new Set<string>();
+  // Background processor for delayed retries
+  delayedQueueInterval = setInterval(async () => {
+    if (isShuttingDown) return;
+    try {
+      await DelayedQueueManager.processReadyJobs(20);
+    } catch (err) {
+      console.error("[Worker] Delayed queue processor error:", err);
+    }
+  }, 1000);
 
+  const ownedPartitions = new Set<string>();
   const scheduler = new Scheduler();
 
-  //HearBeat
   void startHeartbeat(ownedPartitions, workerId, scheduler);
-
   void startClaimLoop(ownedPartitions, workerId, scheduler);
-
   void startRebalance(workerId, ownedPartitions, scheduler);
-  async function startRebalance(
-    workerId: string,
-    ownedPartitions: Set<string>,
-    scheduler: Scheduler,
-  ) {
-    while (!isShuttingDown) {
-      try {
-        const workers = await getActiveWorkers();
-        if (workers.length === 0) {
-          await sleep(5000);
-          continue;
-        }
-        const fairShare = Math.ceil(ALL_PARTITIONS.length / workers.length);
 
-        const maxAllowedPartition = fairShare + 1;
-
-        if (ownedPartitions.size > maxAllowedPartition) {
-          const partitionToRelease = [...ownedPartitions][0];
-          console.log(
-            `⚖️ ${workerId} releasing ${partitionToRelease} for rebalance`,
-          );
-
-          await releasePartition(partitionToRelease, workerId);
-
-          ownedPartitions.delete(partitionToRelease);
-
-          scheduler.updateQueues(Array.from(ownedPartitions));
-        }
-      } catch (error) {
-        console.error("Rebalance loop error", error);
-      }
-
-      await sleep(10000);
-    }
-  }
-
+  // Main consumer loop
   while (!isShuttingDown) {
-    const delay = 2000 + Math.floor(Math.random() * 1000);
-    let job: any = null;
+    let streamMessage: any = null;
     let endJobTimer: (() => void) | undefined;
+    let lockHandle: LockHandle | null = null;
 
     try {
       const queue = scheduler.nextQueue();
 
       if (!queue) {
-        await sleep(500); // Same as BACKOFF_MS
+        await sleep(50);
         continue;
       }
 
-      /**
-       * BLPOP (blocking pop with timeout)
-       *
-       * Why timeout?
-       * - Avoid blocking forever
-       * - Allows loop to continue and switch queues
-       */
-      console.log(`👀 ${workerId} polling ${queue}`);
+      // Read next message immediately (non-blocking)
+      streamMessage = await RedisStreamQueue.readNextJob(queue, workerId, undefined, 0);
 
-      const result = await redisClient.blPop(queue, 1);
+      // If no new messages, check for abandoned jobs in stream
+      if (!streamMessage) {
+        streamMessage = await RedisStreamQueue.claimAbandonedJob(queue, workerId, undefined, 30000);
+      }
 
-      scheduler.recordResult(queue, !!result);
+      scheduler.recordResult(queue, !!streamMessage);
 
-      if (!result) {
+      if (!streamMessage) {
         continue;
       }
 
-      /**
-       * Parse job from Redis
-       */
-      job = JSON.parse(result.element);
-
-      console.log(`📥 Job received: ${job.id}`);
-
+      activeJobsCount++;
+      const job = streamMessage.data;
       const totalStart = performance.now();
 
-      /**
-     
-       * ///////////// STEP 1: ATOMIC DB UPDATE (CRITICAL)
-       *
-       * This is the MOST IMPORTANT LINE in the entire system.
-       *
-       * Why?
-       * - Prevents race conditions
-       * - Ensures ONLY ONE worker owns the job
-       *
-       * Instead of:
-       * ❌ read → then update (unsafe)
-       *
-       * We do:
-       * ✅ update IF status = QUEUED
-       */
+      console.log(`📥 Job received: ${job.id} (type: ${job.type}, priority: ${job.priority})`);
 
-      const dbProcessingStart = performance.now();
-
-      let updated;
-
-      const endDbProcessing = dbDuration.startTimer({
-        operation: "update_processing",
-      });
+      // ============================================================
+      // STEP 1: CONDITIONAL DB TRANSITION TO PROCESSING
+      // ============================================================
+      const endDbProcessing = dbDuration.startTimer({ operation: "update_processing" });
+      let claimedJob: any = null;
 
       try {
-        updated = await prisma.job.updateMany({
-          where: {
-            id: job.id,
-            status: "QUEUED",
-          },
-          data: {
-            status: "PROCESSING",
-            startedAt: new Date(),
-            workerId,
-            errorMessage: null,
-          },
-        });
+        claimedJob = await JobStateService.transitionToProcessing(job.id, workerId);
       } finally {
         endDbProcessing();
       }
 
-      console.log(
-        "DB -> PROCESSING:",
-        (performance.now() - dbProcessingStart).toFixed(2),
-        "ms",
-      );
-      /**
-       * If no rows updated:
-       * → another worker already took this job
-       * → skip safely
-       */
-      if (updated.count === 0) {
-        console.log(`⚡ Job already taken: ${job.id}`);
+      if (!claimedJob) {
+        console.log(`⚡ Job ${job.id} already processed or claimed by another worker. Acknowledging.`);
+        await RedisStreamQueue.acknowledgeAndClean(streamMessage.streamName, streamMessage.streamMessageId);
+        activeJobsCount--;
         continue;
       }
 
       await metrics.incrementProcessing(job.type);
 
-      /**
-       * ============================================================
-       * STEP 2: REDIS LOCK (EXECUTION SAFETY)
-       * ============================================================
-       *
-       * Why lock if DB already handled ownership?
-       *
-       * DB → decides WHO owns job
-       * Lock → prevents PARALLEL EXECUTION (timing issues)
-       *
-       * Lock is temporary (EX: 30s)
-       * Prevents:
-       * - duplicate execution
-       * - race due to retries
-       */
-      const redisStart = performance.now();
+      // ============================================================
+      // STEP 2: DISTRIBUTED LOCK WITH AUTOMATIC HEARTBEAT
+      // ============================================================
       const lockKey = `lock:${job.id}`;
+      const uniqueToken = `${workerId}:${crypto.randomUUID()}`;
 
-      const lockAcquired = await redisClient.set(lockKey, "worker", {
-        NX: true,
-        EX: 120,
-      });
+      lockHandle = await DistributedLockManager.acquireLockWithHeartbeat(lockKey, 30, uniqueToken);
 
-      /**
-       * If lock fails:
-       * → another worker is executing
-       *
-       * BUT we already marked DB as PROCESSING ❌
-       * So we MUST revert ownership
-       */
-      if (!lockAcquired) {
-        console.log(`🔒 Job already locked: ${job.id}`);
-
-        /**
-         * Revert DB state (VERY IMPORTANT)
-         *
-         * Without this:
-         * → job stuck in PROCESSING forever 💀
-         */
-        await prisma.job.update({
-          where: { id: job.id },
-          data: {
-            status: "QUEUED",
-            startedAt: null,
-            workerId: null,
-          },
-        });
-
+      if (!lockHandle.acquired) {
+        console.warn(`🔒 Job already locked by another worker: ${job.id}. Reverting DB state.`);
+        await JobStateService.revertToQueued(job.id, workerId);
+        activeJobsCount--;
         continue;
       }
 
-      /**
-       * ============================================================
-       * STEP 3: IDEMPOTENCY CHECK (FAST PATH)
-       * ============================================================
-       *
-       * Redis = optimization (fast)
-       * DB = truth (slow but correct)
-       *
-       * If processed key exists:
-       * → skip execution quickly
-       */
-      const isProcessed = await redisClient.exists(`processed:${job.id}`);
-
-      if (isProcessed) {
-        console.log(`⚡ Skipping job (fast path): ${job.id}`);
-
-        /**
-         * Always release lock before skipping
-         */
-
-        await redisClient.del(lockKey);
-        console.log(
-          "Redis:",
-          (performance.now() - redisStart).toFixed(2),
-          "ms",
-        );
+      // ============================================================
+      // STEP 3: IDEMPOTENCY CHECK (FAST PATH VIA REDIS)
+      // ============================================================
+      const isAlreadyProcessed = await redisClient.exists(`processed:${job.id}`);
+      if (isAlreadyProcessed) {
+        console.log(`⚡ Skipping job (fast-path idempotency): ${job.id}`);
+        await RedisStreamQueue.acknowledgeAndClean(streamMessage.streamName, streamMessage.streamMessageId);
+        await lockHandle.release();
+        activeJobsCount--;
         continue;
       }
-      // Start timer only when actual job processing begins
+
+      // ============================================================
+      // STEP 4: EXECUTE BUSINESS LOGIC
+      // ============================================================
       endJobTimer = jobDuration.startTimer();
-
-      /**
-       * ============================================================
-       * STEP 4: EXECUTE JOB
-       * ============================================================
-       *
-       * This is where business logic runs
-       *
-       * IMPORTANT:
-       * - This must be idempotent
-       * - Because duplicates can still happen
-       */
       const processStart = performance.now();
-
       const endBusinessTimer = businessLogicDuration.startTimer();
+
       try {
         await processJob(job);
       } finally {
@@ -427,177 +314,105 @@ async function startWorker() {
 
       const duration = performance.now() - processStart;
 
-      console.log("Business Logic:", duration.toFixed(2), "ms");
-      /**
-       * ============================================================
-       * STEP 5: MARK COMPLETED (DB)
-       * ============================================================
-       *
-       * DB is source of truth
-       */
-
-      const dbCompleteStart = performance.now();
-      const endDbCompleted = dbDuration.startTimer({
-        operation: "update_completed",
-      });
+      // ============================================================
+      // STEP 5: MARK COMPLETED IN DB & METRICS
+      // ============================================================
+      const endDbCompleted = dbDuration.startTimer({ operation: "update_completed" });
       try {
-        await prisma.job.update({
-          where: { id: job.id },
-          data: {
-            status: "COMPLETED",
-            completedAt: new Date(),
-            errorMessage: null,
-          },
-        });
+        await JobStateService.transitionToCompleted(job.id, workerId);
       } finally {
         endDbCompleted();
       }
-      console.log(
-        "DB -> COMPLETED:",
-        (performance.now() - dbCompleteStart).toFixed(2),
-        "ms",
-      );
+
       try {
         await metrics.incrementProcessed(job.type);
+        await metrics.decrementProcessing(job.type);
+        await metrics.recordProcessingTime(job.type, duration);
       } catch (e) {
-        console.error("Metrics error", e);
+        console.error("[Worker] Metrics error:", e);
       }
 
-      try {
-        await metrics.decrementProcessing(job.type);
-      } catch (e) {
-        console.error("Metrics decrement error", e);
-      }
-      await metrics.recordProcessingTime(job.type, duration);
-      /**
-       * ============================================================
-       * STEP 6: MARK PROCESSED (REDIS)
-       * ============================================================
-       *
-       * This is NOT for correctness
-       * This is for PERFORMANCE
-       *
-       * Helps skip duplicate jobs quickly
-       */
+      // Mark processed in Redis cache for 1 hour to optimize duplicates
       await redisClient.set(`processed:${job.id}`, "true", { EX: 3600 });
 
-      /**
-       * ============================================================
-       * STEP 7: RELEASE LOCK
-       * ============================================================
-       */
+      // Acknowledge and remove from Redis Stream
+      await RedisStreamQueue.acknowledgeAndClean(streamMessage.streamName, streamMessage.streamMessageId);
 
-      await redisClient.del(lockKey);
-      console.log("Redis:", (performance.now() - redisStart).toFixed(2), "ms");
+      // Release lock atomically
+      await lockHandle.release();
 
-      console.log(`✅ Job completed: ${job.id}`);
-
-      console.log(
-        "TOTAL JOB TIME:",
-        (performance.now() - totalStart).toFixed(2),
-        "ms",
-      );
+      console.log(`✅ Job completed: ${job.id} in ${(performance.now() - totalStart).toFixed(2)}ms`);
     } catch (error: any) {
-      console.error("❌ Worker error:", error);
+      console.error("❌ Worker execution error:", error.message);
 
+      const job = streamMessage?.data;
       if (job?.type) {
         await metrics.incrementFailed(job.type);
+        try {
+          await metrics.decrementProcessing(job.type);
+        } catch {}
       }
+
       if (job?.id) {
         try {
-          /**
-           * ============================================================
-           * FAILURE HANDLING
-           * ============================================================
-           */
-          const jobFromDB = await prisma.job.findUnique({
-            where: { id: job.id },
-          });
+          const currentJob = await JobStateService.getJob(job.id);
+          const currentAttempts = currentJob ? currentJob.attempts : job.attempts || 0;
+          const maxRetries = currentJob ? currentJob.maxRetries : job.maxRetries || 3;
+          const nextAttempts = currentAttempts + 1;
 
-          if (!jobFromDB) continue;
+          const nonRetryable = isNonRetryableError(error);
 
-          const attempts = jobFromDB.attempts;
-          const maxRetries = jobFromDB.maxRetries;
-
-          /**
-           * ============================================================
-           * RETRY LOGIC
-           * ============================================================
-           *
-           * If attempts < maxRetries:
-           * → retry job
-           *
-           * Else:
-           * → mark FAILED permanently
-           */
-          const newAttempts = attempts + 1;
-          if (newAttempts < maxRetries) {
-            console.log(`🔁 Retrying job ${job.id}, attempt ${newAttempts}`);
-
+          if (!nonRetryable && nextAttempts < maxRetries) {
+            console.log(`🔁 Scheduling retry for job ${job.id}, attempt ${nextAttempts}/${maxRetries}`);
             await metrics.incrementRetry(job.type);
 
-            await sleep(delay);
+            await JobStateService.transitionToRetry(job.id, workerId, error.message, nextAttempts);
 
-            await prisma.job.update({
-              where: { id: job.id },
-              data: {
-                attempts: newAttempts,
-                status: "QUEUED",
-                errorMessage: error.message,
-                startedAt: null,
-                workerId: null,
+            const delayMs = calculateBackoffDelay(nextAttempts);
+
+            // Schedule via non-blocking delayed queue instead of blocking sleep
+            await DelayedQueueManager.scheduleRetry(
+              {
+                id: job.id,
+                userId: job.userId,
+                type: job.type,
+                payload: job.payload,
+                priority: job.priority,
+                maxRetries,
+                attempts: nextAttempts,
               },
-            });
-
-            job.attempts = newAttempts;
-            /**
-             * Requeue job
-             *
-             * IMPORTANT:
-             * We allow duplicates here
-             * Idempotency will handle safety
-             */
-            const retryQueue = getPartitionedQueue(job.priority, job.userId);
-
-            await redisClient.rPush(retryQueue, JSON.stringify(job));
+              delayMs,
+            );
           } else {
-            /**
-             * Max retries exceeded → permanent failure
-             */
-            // 💀 DLQ
-
-            console.log(`💀 Job moved to DLQ: ${job.id}`);
-
+            console.log(`💀 Moving job to DLQ: ${job.id} (${nonRetryable ? "Non-retryable error" : "Max retries exceeded"})`);
             await metrics.incrementDLQ(job.type);
-            await prisma.job.update({
-              where: { id: job.id },
-              data: {
-                attempts: newAttempts,
-                status: "DLQ",
-                errorMessage: error.message,
-                failedAt: new Date(),
-                startedAt: null,
-                workerId: null,
-              },
-            });
+
+            await JobStateService.transitionToDLQ(job.id, workerId, error.message, nextAttempts);
           }
 
-          /**
-           * Always release lock AFTER DB update
-           */
-          try {
-            await redisClient.del(`lock:${job.id}`);
-          } catch (e) {
-            console.error("⚠️ Failed to release lock", e);
+          // Acknowledge the failed/retried stream message so it does not stay in PEL
+          if (streamMessage) {
+            await RedisStreamQueue.acknowledgeAndClean(streamMessage.streamName, streamMessage.streamMessageId);
           }
         } catch (innerError) {
-          console.error("❌ Error handling failed job:", innerError);
+          console.error("❌ Error in failure handling:", innerError);
+        } finally {
+          if (lockHandle) {
+            await lockHandle.release();
+          }
         }
       }
     } finally {
-     endJobTimer?.();
+      endJobTimer?.();
+      activeJobsCount = Math.max(0, activeJobsCount - 1);
     }
   }
 }
-startMetricsServer(Number(process.env.WORKER_METRICS_PORT) || 3001);
-startWorker();
+
+if (require.main === module) {
+  startMetricsServer(Number(process.env.WORKER_METRICS_PORT) || 3001);
+  startWorker().catch((err) => {
+    console.error("Fatal worker startup failure:", err);
+    process.exit(1);
+  });
+}

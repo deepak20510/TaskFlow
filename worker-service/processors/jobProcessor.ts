@@ -1,35 +1,67 @@
-export async function processJob(job: any) {
-  console.log("Processing job:", job.type);
+import { NonRetryableError } from "../../shared/errors/jobErrors";
 
-  switch (job.type) {
+export interface JobPayload {
+  to?: string;
+  file?: string;
+  source?: string;
+  processingTime?: number;
+  [key: string]: any;
+}
+
+export async function processJob(job: {
+  id: string;
+  type: string;
+  payload: JobPayload;
+}): Promise<void> {
+  if (!job.type) {
+    throw new NonRetryableError("Job type is required");
+  }
+
+  const payload = job.payload || {};
+
+  switch (job.type.toUpperCase()) {
     case "EMAIL":
-      await handleEmail(job.payload);
+      await handleEmail(payload);
       break;
 
     case "IMAGE":
-      await handleImage(job.payload);
+      await handleImage(payload);
       break;
-    case "benchmark":
-      // Used only for benchmarking
-      await new Promise((resolve) => setTimeout(resolve, 1));
+
+    case "BENCHMARK":
+      await handleBenchmark(payload);
       break;
+
     default:
-      console.log("Unknown job type");
+      // Unknown job types must throw a NonRetryableError so they are routed to DLQ rather than completed!
+      throw new NonRetryableError(`Unknown job type: "${job.type}"`);
+  }
+}
+
+async function handleEmail(payload: JobPayload): Promise<void> {
+  if (!payload.to || typeof payload.to !== "string") {
+    throw new NonRetryableError("Email job requires a valid 'to' recipient in payload");
   }
 
-  console.log("Job completed:", job.id);
+  // Simulated processing delay
+  const delayMs = typeof payload.processingTime === "number" ? payload.processingTime : 50;
+  await new Promise((res) => setTimeout(res, delayMs));
 }
 
-// Simulated handlers
-async function handleEmail(payload: any) {
-  console.log("Sending email to:", payload.to);
+async function handleImage(payload: JobPayload): Promise<void> {
+  if (!payload.file || typeof payload.file !== "string") {
+    throw new NonRetryableError("Image job requires a valid 'file' string in payload");
+  }
 
-  // simulate delay
-  await new Promise((res) => setTimeout(res, 2000));
+  const delayMs = typeof payload.processingTime === "number" ? payload.processingTime : 50;
+  await new Promise((res) => setTimeout(res, delayMs));
 }
 
-async function handleImage(payload: any) {
-  console.log("Processing image:", payload.file);
+async function handleBenchmark(payload: JobPayload): Promise<void> {
+  const processingTime =
+    typeof payload.processingTime === "number" && payload.processingTime >= 0
+      ? payload.processingTime
+      : 1;
 
-  await new Promise((res) => setTimeout(res, 3000));
+  await new Promise((resolve) => setTimeout(resolve, processingTime));
 }

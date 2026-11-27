@@ -1,199 +1,161 @@
+import "dotenv/config";
 import { connectRedis, redisClient } from "../shared/redis/redisClient";
-
 import prisma from "../api-service/dbclient";
-import { getPartitionedQueue } from "../shared/utils/partition";
-const STUCK_THRESHOLD = 10000; // 10 seconds
+import { getAllStreams } from "../shared/utils/partition";
+import { RedisStreamQueue } from "../shared/redis/streamQueue";
+import { OutboxPublisher } from "../shared/outbox/outboxPublisher";
+import { DistributedLockManager } from "../shared/redis/lockManager";
 
-async function sleep(ms: number) {
+const STUCK_THRESHOLD_MS = 60000; // 60 seconds of inactivity before considering a processing job stuck
+const SCANNER_INTERVAL_MS = 5000;
+const SCANNER_LOCK_KEY = "recovery:scanner:lock";
+
+async function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-async function startScanner() {
-  await connectRedis();
-  console.log("🔍 Recovery scanner started...");
+export async function runRecoveryCycle(): Promise<void> {
+  // Acquire distributed lock so only one scanner runs at any given moment across clusters
+  const lock = await DistributedLockManager.acquireLock(SCANNER_LOCK_KEY, 15);
+  if (!lock.acquired) {
+    return;
+  }
 
-  while (true) {
-    try {
-      const now = new Date();
+  try {
+    // ============================================================
+    // 1. OUTBOX EVENTS PUBLISHING
+    // ============================================================
+    const outboxResult = await OutboxPublisher.publishPendingEvents();
+    if (outboxResult.processed > 0) {
+      console.log(
+        `📤 [Recovery] Outbox published: ${outboxResult.succeeded}/${outboxResult.processed} (failed: ${outboxResult.failed})`,
+      );
+    }
 
-      // threshold time = current time - 10 seconds
-      // any job started before this and still processing → considered stuck
-      const thresholdTime = new Date(Date.now() - STUCK_THRESHOLD);
+    // ============================================================
+    // 2. RECOVER ABANDONED STREAM MESSAGES (PEL)
+    // ============================================================
+    const allStreams = getAllStreams();
+    for (const stream of allStreams) {
+      const abandonedJob = await RedisStreamQueue.claimAbandonedJob(
+        stream,
+        "recovery-scanner",
+        undefined,
+        STUCK_THRESHOLD_MS,
+      );
 
-      // ============================================================
-      // 1. FIND QUEUED JOBS (MISSED / NEVER ENQUEUED)
-      // ============================================================
-
-      // Why do we scan QUEUED jobs?
-      // Scenario:
-      // API successfully writes job to DB
-      // BUT fails to push to Redis (network issue / crash)
-      // → Job is stuck in DB and never processed ❌
-
-      // So recovery system ensures:
-      // “Every QUEUED job eventually reaches Redis”
-
-      const queuedJobs = await prisma.job.findMany({
-        where: {
-          status: "QUEUED",
-          createdAt: {
-            lt: new Date(Date.now() - 10000),
-          },
-        },
-
-        take: 50, // batch limit → prevents DB overload
-      });
-
-      for (const job of queuedJobs) {
-        // Why we blindly requeue without checking Redis?
-
-        // Because:
-        // 1. Redis does NOT guarantee accurate membership
-        // 2. Checking Redis is expensive (SCAN / lookup)
-        // 3. Distributed systems accept duplicates
-
-        // Instead we rely on:
-        // → Worker idempotency
-        // → DB status validation
-        if (job.attempts >= job.maxRetries) {
-          continue;
-        }
-        const queueName = getPartitionedQueue(
-          job.priority.toLowerCase(),
-          job.userId,
-        );
-
-        await redisClient.rPush(
-          queueName,
-          JSON.stringify({
-            id: job.id,
-            userId: job.userId,
-            type: job.type,
-            payload: job.payload,
-            priority: job.priority.toLowerCase(),
-          }),
-        );
-        console.log(`♻️ Re-enqueued QUEUED job: ${job.id}`);
-        await sleep(50);
+      if (abandonedJob) {
+        console.log(`♻️ [Recovery] Autoclaimed message ${abandonedJob.streamMessageId} in stream ${stream}`);
       }
+    }
 
-      // ============================================================
-      // 2. FIND STUCK JOBS (PROCESSING TOO LONG)
-      // ============================================================
+    // ============================================================
+    // 3. RECOVER STUCK DB JOBS WHOSE WORKERS CRASHED
+    // ============================================================
+    const thresholdTime = new Date(Date.now() - STUCK_THRESHOLD_MS);
 
-      // Scenario:
-      // Worker picks job → sets status = PROCESSING
-      // BUT crashes before completion 💥
+    const stuckJobs = await prisma.job.findMany({
+      where: {
+        status: "PROCESSING",
+        startedAt: { lt: thresholdTime },
+      },
+      take: 50,
+    });
 
-      // Result:
-      // Job is stuck forever in PROCESSING ❌
-
-      // So we detect:
-      // startedAt < thresholdTime → worker likely dead
-
-      const stuckJobs = await prisma.job.findMany({
-        where: {
-          status: "PROCESSING",
-
-          startedAt: {
-            lt: thresholdTime,
-          },
-        },
-        take: 50,
-      });
-
-      for (const job of stuckJobs) {
-        if (job.attempts >= job.maxRetries) {
-          continue;
-        }
-        const lockKey = `lock:${job.id}`;
-        const activeLock = await redisClient.get(lockKey);
-
-        // Why check lock?
-
-        // If lock exists:
-        // → Worker is still processing
-        // → Maybe job is slow, NOT stuck
-
-        // Without this check:
-        // → We might requeue active jobs
-        // → Duplicate execution 💥
-
-        if (activeLock) {
-          console.log(`🔒 Job still active: ${job.id}`);
-          continue;
-        }
-        const workerAlive = await redisClient.exists(
-          `active_worker:${job.workerId}`,
-        );
-
-        if (workerAlive) {
-          console.log(`🟢 Worker still alive for job ${job.id}`);
-          continue;
-        }
-        console.log(`⚠️ Stuck job detected: ${job.id}`);
-
-        // Reset job back to QUEUED
-
-        // Why not directly mark FAILED?
-        // Because:
-        // → Failure is uncertain (worker crash vs real failure)
-        // → safer to retry than lose job
-
+    for (const job of stuckJobs) {
+      if (job.attempts >= job.maxRetries) {
+        // Move to DLQ if max retries reached
         await prisma.job.update({
           where: { id: job.id },
           data: {
+            status: "DLQ",
+            errorMessage: "Worker crashed and job exceeded max retries",
+            failedAt: new Date(),
+            startedAt: null,
+            workerId: null,
+          },
+        });
+        console.log(`💀 [Recovery] Job ${job.id} moved to DLQ (exceeded max retries)`);
+        continue;
+      }
+
+      // Check if the worker is still actively holding a lock or heartbeat
+      const lockKey = `lock:${job.id}`;
+      const activeLock = await redisClient.get(lockKey);
+      if (activeLock) {
+        // Worker lock is still active and valid; job is just long-running
+        continue;
+      }
+
+      if (job.workerId) {
+        const workerAlive = await redisClient.exists(`active_worker:${job.workerId}`);
+        if (workerAlive) {
+          // Worker is alive and may be finishing up
+          continue;
+        }
+      }
+
+      console.warn(`⚠️ [Recovery] Stuck job detected (dead worker): ${job.id}`);
+
+      // Atomically reset status to QUEUED and re-publish to Outbox
+      const streamName = `${job.priority.toLowerCase()}_priority_stream:${job.id.charCodeAt(0) % 4}`;
+
+      await prisma.$transaction(async (tx) => {
+        await tx.job.update({
+          where: { id: job.id },
+          data: {
             status: "QUEUED",
-            errorMessage: "Recovered from stuck state",
+            errorMessage: "Recovered from dead worker",
             startedAt: null,
             workerId: null,
           },
         });
 
-        // Requeue job
+        await tx.outboxEvent.create({
+          data: {
+            jobId: job.id,
+            streamName,
+            payload: {
+              id: job.id,
+              userId: job.userId,
+              type: job.type,
+              payload: job.payload,
+              priority: job.priority.toLowerCase(),
+              maxRetries: job.maxRetries,
+              attempts: job.attempts,
+            },
+            status: "PENDING",
+          },
+        });
+      });
 
-        // Why duplication is safe here?
-
-        // Because:
-        // Worker will:
-        // 1. Check DB status
-        // 2. Check processed key
-        // → Skip duplicates safely
-
-        const queueName = getPartitionedQueue(
-          job.priority.toLowerCase(),
-          job.userId,
-        );
-
-        await redisClient.rPush(
-          queueName,
-          JSON.stringify({
-            id: job.id,
-            userId: job.userId,
-            type: job.type,
-            payload: job.payload,
-            priority: job.priority.toLowerCase(),
-          }),
-        );
-
-        console.log(`♻️ Recovered and re-queued job: ${job.id}`);
-      }
-    } catch (err) {
-      console.error("❌ Scanner error:", err);
+      console.log(`♻️ [Recovery] Re-queued stuck job via Outbox: ${job.id}`);
     }
-
-    // Why delay between scans?
-
-    // Without delay:
-    // → Continuous DB hammering ❌
-    // → High CPU + DB load ❌
-
-    // With delay:
-    // → Controlled recovery cycles ✅
-    // → Better system stability ✅
-
-    await sleep(5000);
+  } catch (err) {
+    console.error("❌ [Recovery] Scanner error:", err);
+  } finally {
+    await lock.release();
   }
 }
 
-startScanner();
+export async function startScanner(): Promise<void> {
+  await connectRedis();
+  console.log("🔍 Recovery scanner service started...");
+
+  while (true) {
+    try {
+      await runRecoveryCycle();
+    } catch (err) {
+      console.error("❌ [Recovery] Loop error:", err);
+    }
+    await sleep(SCANNER_INTERVAL_MS);
+  }
+}
+
+// Auto-start if invoked directly via ts-node
+if (require.main === module) {
+  startScanner().catch((err) => {
+    console.error("Fatal scanner crash:", err);
+    process.exit(1);
+  });
+}

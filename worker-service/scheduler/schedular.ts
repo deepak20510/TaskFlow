@@ -44,13 +44,13 @@ export class Scheduler {
   private buildWeightedSchedule() {
     this.weightedSchedule = [];
 
-    const high = this.queues.filter((q) => q.startsWith("high_priority_queue"));
+    const high = this.queues.filter((q) => q.startsWith("high_priority"));
 
     const medium = this.queues.filter((q) =>
-      q.startsWith("medium_priority_queue"),
+      q.startsWith("medium_priority"),
     );
 
-    const low = this.queues.filter((q) => q.startsWith("low_priority_queue"));
+    const low = this.queues.filter((q) => q.startsWith("low_priority"));
 
     const addPriorityGroup = (queues: string[], weight: number) => {
       if (queues.length === 0) return;

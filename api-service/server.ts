@@ -1,68 +1,103 @@
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import dotenv from "dotenv";
 import jobRouter from "./routes/job.routes";
 import metricsRouter from "./routes/metrics.routes";
 import { connectRedis, redisClient } from "../shared/redis/redisClient";
 import { rateLimitMiddleware } from "./middleware/rateLimitMiddleware";
 import { backPressureMiddleware } from "./middleware/backPressure.middleware";
+import { OutboxPublisher } from "../shared/outbox/outboxPublisher";
+import prisma from "./dbclient";
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 
 app.use(
   express.json({
     limit: "10mb",
   }),
 );
-app.use((err: any, req: any, res: any, next: any) => {
-  console.error("JSON PARSE ERROR");
-  console.error(err);
 
-  res.status(400).json({
-    message: err.message,
+// JSON syntax error handler
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: "INVALID_JSON",
+        message: "Malformed JSON in request body",
+      },
+    });
+  }
+  next(err);
+});
+
+app.get("/", (req, res) => {
+  res.json({
+    name: "TaskFlow API Service",
+    status: "running",
+    version: "1.0.0",
   });
 });
-app.get("/", (req, res) => {
-  res.send("API is running");
-});
-app.use((req, res, next) => {
-  console.log("REQUEST RECEIVED");
-  next();
-});
+
 app.get("/health", async (req, res) => {
   try {
     await redisClient.ping();
-    res.status(200).json({ status: "OK" });
-  } catch {
-    res.status(500).json({ status: "DOWN" });
+    await prisma.$queryRaw`SELECT 1`;
+    res.status(200).json({
+      status: "OK",
+      redis: "UP",
+      database: "UP",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(503).json({
+      status: "DOWN",
+      error: err.message,
+    });
   }
 });
 
+// Job management routes (supports both /jobs and /api/jobs)
 app.use("/jobs", rateLimitMiddleware, backPressureMiddleware, jobRouter);
+app.use("/api/jobs", rateLimitMiddleware, backPressureMiddleware, jobRouter);
 
+// Prometheus & JSON metrics routes (supports both /metrics and /api/metrics)
 app.use("/metrics", metricsRouter);
+app.use("/api/metrics", metricsRouter);
 
-// global error handler
-app.use((err: any, req: any, res: any, next: any) => {
+// Global Error Handler
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   console.error("===== GLOBAL ERROR =====");
-  console.error(err);
   console.error("Message:", err.message);
-  console.error("Stack:", err.stack);
+
+  const isProduction = process.env.NODE_ENV === "production";
+  if (!isProduction && err.stack) {
+    console.error("Stack:", err.stack);
+  }
 
   res.status(err.status || 500).json({
     success: false,
-    message: err.message,
+    error: {
+      code: err.code || "INTERNAL_ERROR",
+      message: err.message || "An unexpected internal server error occurred",
+      ...(!isProduction && err.stack ? { stack: err.stack } : {}),
+    },
   });
 });
+
+let serverInstance: any = null;
 
 async function startServer() {
   try {
     await connectRedis();
 
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
+    // Start background outbox publisher daemon
+    OutboxPublisher.startDaemon(2000);
+
+    serverInstance = app.listen(PORT, () => {
+      console.log(`🚀 TaskFlow API server running on port ${PORT}`);
     });
   } catch (error) {
     console.error("❌ Failed to start server:", error);
@@ -70,10 +105,32 @@ async function startServer() {
   }
 }
 
-// graceful shutdown
-process.on("SIGINT", () => {
-  console.log("🛑 Shutting down...");
-  process.exit(0);
-});
+// Graceful Shutdown
+async function handleShutdown() {
+  console.log("🛑 Gracefully shutting down API server...");
 
-startServer();
+  OutboxPublisher.stopDaemon();
+
+  if (serverInstance) {
+    serverInstance.close(() => {
+      console.log("HTTP server closed.");
+    });
+  }
+
+  try {
+    await prisma.$disconnect();
+    await redisClient.quit();
+  } catch {}
+
+  process.exit(0);
+}
+
+process.on("SIGINT", handleShutdown);
+process.on("SIGTERM", handleShutdown);
+
+if (require.main === module) {
+  startServer();
+}
+
+export default app;
+export { app, startServer };
